@@ -3,16 +3,29 @@ from datetime import datetime
 import json
 import os
 import re
+import asyncio
+from queue import Queue
+from threading import Thread
 
 # -------- AI MODEL LOAD --------
+CPU_THREADS = max(1, (os.cpu_count() or 2) - 1)
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phi-2.Q4_K_M.gguf")
+
 llm = Llama(
-    model_path="phi-2.Q4_K_M.gguf",
-    n_ctx=2048,
+    model_path=MODEL_PATH,
+    n_ctx=1024,
+    n_batch=512,
+    n_ubatch=512,
+    n_threads=CPU_THREADS,
+    n_threads_batch=CPU_THREADS,
+    use_mmap=True,
+    offload_kqv=True,
+    flash_attn=True,
     verbose=False
 )
 
 # -------- MEMORY SETUP --------
-MEMORY_FILE = "memory/memory.json"
+MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory", "memory.json")
 
 def load_memory():
     if not os.path.exists(MEMORY_FILE):
@@ -21,6 +34,7 @@ def load_memory():
         return json.load(f)
 
 def save_memory(mem):
+    os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(mem, f, indent=2, ensure_ascii=False)
 
@@ -57,7 +71,7 @@ def should_remember(text):
 
 # -------- NAME DETECT --------
 def detect_name(text):
-    match = re.match(r"my name is (\w+)", text.lower())
+    match = re.match(r"(?:my name is|i am)\s+([\w'-]+)\s*[.!?]*$", text.strip(), re.IGNORECASE)
     if match:
         return match.group(1).capitalize()
     return None
@@ -65,59 +79,87 @@ def detect_name(text):
 # -------- NAME RECALL --------
 def get_saved_name():
     for m in reversed(load_memory()):
-        if m["text"].lower().startswith("user name is"):
-            return m["text"].split("is")[-1].strip().capitalize()
+        text = m.get("text", "")
+        match = re.fullmatch(r"user name is\s+(.+?)\s*[.!?]*", text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip().capitalize()
     return None
 
-print("🤖 SHADOW AI READY (OFFLINE + MEMORY)")
-print("Type 'bye' to quit\n")
+async def stream_response(prompt):
+    """Generate in a worker thread while the asyncio loop remains responsive."""
+    chunks = Queue()
 
-# -------- CHAT LOOP --------
-while True:
-    user = input("You: ").strip()
+    def generate():
+        try:
+            for output in llm(
+                prompt,
+                max_tokens=96,
+                temperature=0.6,
+                top_p=0.9,
+                stop=["User:", "You:"],
+                stream=True
+            ):
+                chunks.put(output["choices"][0]["text"])
+        except Exception as error:
+            chunks.put(error)
+        finally:
+            chunks.put(None)
 
-    if not user:
-        continue
+    Thread(target=generate, daemon=True).start()
+    reply_parts = []
+    while True:
+        chunk = await asyncio.to_thread(chunks.get)
+        if chunk is None:
+            break
+        if isinstance(chunk, Exception):
+            raise chunk
+        print(chunk, end="", flush=True)
+        reply_parts.append(chunk)
+    print()
+    return "".join(reply_parts).strip()
 
-    if user.lower() == "bye":
-        print("AI: Bye! Jo bola hai wo yaad rahega 😏")
-        break
 
-    # -------- GREETING --------
-    if user.lower() in ["hi", "hello", "hey"]:
-        print("AI: Hi 👋 bolo, kya help chahiye?")
-        continue
+async def chat_loop():
+    print("🤖 SHADOW AI READY (OFFLINE + MEMORY)")
+    print("Type 'bye' to quit\n")
 
-    # -------- NAME SAVE --------
-    name = detect_name(user)
-    if name:
-        add_memory(f"User name is {name}")
-        print(f"AI: Nice to meet you, {name} 😊")
-        continue
+    while True:
+        user = (await asyncio.to_thread(input, "You: ")).strip()
 
-    # -------- NAME QUESTION --------
-    if user.lower() in ["what is my name", "tell me my name"]:
-        saved_name = get_saved_name()
-        if saved_name:
-            print(f"AI: Tumhara naam {saved_name} hai 🙂")
-        else:
-            print("AI: Tumne abhi tak apna naam nahi bataya 😅")
-        continue
+        if not user:
+            continue
 
-    # -------- BROKEN QUESTIONS --------
-    if user.lower() in ["what", "what is i learn", "what is i make"]:
-        print("AI: Thoda clearly pucho 😅 example: 'what should I learn?'")
-        continue
+        if user.lower() == "bye":
+            print("AI: Bye! Jo bola hai wo yaad rahega 😏")
+            break
 
-    # -------- SAVE MEMORY --------
-    if should_remember(user):
-        add_memory(user)
+        if user.lower() in ["hi", "hello", "hey"]:
+            print("AI: Hi 👋 bolo, kya help chahiye?")
+            continue
 
-    # -------- LOAD CLEAN MEMORY --------
-    memory_context = "\n".join(f"- {m}" for m in get_clean_memory())
+        name = detect_name(user)
+        if name:
+            add_memory(f"User name is {name}")
+            print(f"AI: Nice to meet you, {name} 😊")
+            continue
 
-    # -------- PROMPT --------
-    prompt = f"""Background info about the user:
+        if re.fullmatch(r"(?:what is|tell me) my name\??", user.strip(), re.IGNORECASE):
+            saved_name = get_saved_name()
+            if saved_name:
+                print(f"AI: Tumhara naam {saved_name} hai 🙂")
+            else:
+                print("AI: Tumne abhi tak apna naam nahi bataya 😅")
+            continue
+
+        if user.lower() in ["what", "what is i learn", "what is i make"]:
+            print("AI: Thoda clearly pucho 😅 example: 'what should I learn?'")
+            continue
+
+        if should_remember(user):
+            add_memory(user)
+
+        memory_context = "\n".join(f"- {m}" for m in get_clean_memory())
+        prompt = f"""Background info about the user:
 {memory_context}
 
 Answer simply and correctly.
@@ -125,15 +167,11 @@ Answer simply and correctly.
 User: {user}
 AI:"""
 
-    output = llm(
-        prompt,
-        max_tokens=180,   # balanced, not too high
-        temperature=0.6,
-        stop=["User:", "You:"]
-    )
+        print("AI: ", end="", flush=True)
+        reply = await stream_response(prompt)
+        if not reply:
+            print("Isko thoda detail me pucho 🙂")
 
-    reply = output["choices"][0]["text"].strip()
-    if not reply:
-        reply = "Isko thoda detail me pucho 🙂"
 
-    print("AI:", reply)
+if __name__ == "__main__":
+    asyncio.run(chat_loop())
